@@ -1,0 +1,400 @@
+# Sonoff Dual R3 PCB v1.6 (CSE7761) - 3D printer fume fan controller
+# ------------------------------------------------------------------
+# Channel 1 (relay GPIO27): printer - relay stays ON, power is metered
+# Channel 2 (relay GPIO14): fan - switched by power-spike logic
+#
+# Wiring: L/N in; printer live on O1, fan live on O2, neutrals to N.
+# S2 terminal (GPIO33): optional external pushbutton -> manual fan toggle.
+#
+# Metering chip: CSE7761 on GPIO25/26 (38400 EVEN). ESPHome puts this on
+# UART1/2, so UART0 (GPIO1/3, USB console) stays free for the logger.
+# The CSE7761 is powered from the mains side: metering only works when
+# L/N are connected, not on the 3.3V serial adapter.
+#
+# First flash over serial (3.3V UART, hold button on power-up, mains
+# disconnected). All later updates OTA.
+#
+# Controls:
+#   On-board button / S2 short press : fan toggle, switches to Manual mode
+#   On-board button long press (0.4-3s): back to Automatic mode
+#   Manual mode auto-resumes when the printer goes idle and then starts
+#   a new print (heat-up spike). A manual override mid-print holds until
+#   that print ends.
+#   Automatic Mode switch (web/HA)    : same thing, remotely
+#
+# All four tuning values are adjustable live in the web interface
+# ("Configuration" section) and are saved across reboots.
+
+esphome:
+  name: 3d-printer-ventilator
+  friendly_name: 3D Printer Ventilator
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // If we rebooted mid-print the fan re-triggers on the next sample;
+          // anchor the runtime clock so min-runtime maths stays sane.
+          id(fan_started_ms) = millis();
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
+
+logger:
+  level: INFO
+  baud_rate: 115200
+  hardware_uart: UART0   # GPIO1/3 - not used by the CSE7761
+
+api:
+  encryption:
+    key: !secret printer_3d_ventilator__encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret printer_3d_ventilator__ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: 3D Printer Vent Fallback Hotspot
+    password: !secret printer_3d_ventilator__ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 3
+  local: true
+
+# --- Metering chip UART (CSE7761, PCB v1.x) -----------------------
+uart:
+  tx_pin: GPIO25
+  rx_pin: GPIO26
+  baud_rate: 38400
+  parity: EVEN
+  stop_bits: 1
+
+number:
+  - platform: template
+    name: Fan ON threshold
+    id: on_threshold
+    unit_of_measurement: "W"
+    icon: mdi:flash-alert
+    min_value: 20
+    max_value: 500
+    step: 5
+    initial_value: 80
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+  - platform: template
+    name: Fan OFF threshold
+    id: off_threshold
+    unit_of_measurement: "W"
+    icon: mdi:flash-off
+    min_value: 5
+    max_value: 300
+    step: 5
+    initial_value: 35
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+  - platform: template
+    name: Fan run-on time
+    id: fan_run_on_s
+    unit_of_measurement: "s"
+    icon: mdi:timer-sand
+    min_value: 0
+    max_value: 3600
+    step: 30
+    initial_value: 300
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+  - platform: template
+    name: Fan minimum runtime
+    id: fan_min_runtime_s
+    unit_of_measurement: "s"
+    icon: mdi:timer-lock
+    min_value: 0
+    max_value: 3600
+    step: 60
+    initial_value: 600
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+
+globals:
+  - id: fan_started_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: print_count
+    type: int
+    restore_value: true    # survives reboots
+    initial_value: "0"
+  - id: manual_resume_armed
+    type: bool
+    initial_value: "false"
+
+sensor:
+  - platform: cse7761
+    update_interval: 2s
+    voltage:
+      name: Voltage
+    current_1:
+      name: Printer Current
+    current_2:
+      name: Fan Current
+    active_power_2:
+      name: Fan Power
+      id: fan_power
+      filters:
+        # Sign depends on L/N orientation at the input; magnitude is what
+        # matters for the fan logic and energy totals.
+        - lambda: return fabs(x);
+    active_power_1:
+      name: Printer Power
+      id: printer_power
+      filters:
+        - lambda: return fabs(x);
+      on_value:
+        then:
+          - lambda: |-
+              if (isnan(x)) return;
+              if (!id(auto_mode).state) {
+                // Manual mode. Auto-resume only on a genuine new print:
+                // the printer must first go idle (arms), then heat up.
+                // A manual override during a running print is respected
+                // until that print finishes.
+                if (x < id(off_threshold).state) {
+                  id(manual_resume_armed) = true;
+                  return;
+                }
+                if (x >= id(on_threshold).state && id(manual_resume_armed)) {
+                  id(manual_resume_armed) = false;
+                  ESP_LOGI("fan", "New print in manual mode - resuming automatic");
+                  id(auto_mode).turn_on();
+                  // fall through to normal handling
+                } else {
+                  return;
+                }
+              }
+              if (x >= id(on_threshold).state) {
+                // Heat-up spike: cancel any pending off-timers, fan on.
+                // fan_min_wait must be stopped too, otherwise a print that
+                // starts during the min-runtime wait gets its fan cut off.
+                id(fan_off_delay).stop();
+                id(fan_min_wait).stop();
+                if (!id(fan_relay).state) {
+                  ESP_LOGI("fan", "Print detected (%.0f W) - fan ON", x);
+                  id(fan_started_ms) = millis();
+                  id(print_count) += 1;
+                  id(fan_relay).turn_on();
+                }
+              } else if (x < id(off_threshold).state && id(fan_relay).state) {
+                // True idle: start run-on timer once
+                if (!id(fan_off_delay).is_running() && !id(fan_min_wait).is_running()) {
+                  ESP_LOGI("fan", "Idle (%.0f W) - run-on timer started", x);
+                  id(last_print_duration).publish_state(
+                      (millis() - id(fan_started_ms)) / 60000.0);
+                  id(fan_off_delay).execute();
+                }
+              } else {
+                // Between thresholds (printing / bed PWM off-cycle):
+                // hold fan on, cancel any off-timers
+                id(fan_off_delay).stop();
+                id(fan_min_wait).stop();
+              }
+
+  - platform: total_daily_energy
+    name: Printer Daily Energy
+    power_id: printer_power
+
+  - platform: total_daily_energy
+    name: Fan Daily Energy
+    power_id: fan_power
+
+  - platform: template
+    name: Prints Detected
+    accuracy_decimals: 0
+    icon: mdi:counter
+    update_interval: 60s
+    lambda: return id(print_count);
+
+  - platform: template
+    name: Last Print Duration
+    id: last_print_duration
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    icon: mdi:timer-outline
+    update_interval: never
+
+time:
+  - platform: sntp        # needed by total_daily_energy
+
+script:
+  - id: fan_off_delay
+    mode: restart
+    then:
+      - delay: !lambda "return (uint32_t)(id(fan_run_on_s).state * 1000);"
+      - lambda: |-
+          uint32_t elapsed = millis() - id(fan_started_ms);
+          uint32_t min_ms = (uint32_t)(id(fan_min_runtime_s).state * 1000);
+          if (elapsed < min_ms) {
+            uint32_t remaining = min_ms - elapsed;
+            ESP_LOGI("fan", "Min runtime: waiting %lu s more", (unsigned long)(remaining / 1000));
+            id(fan_min_wait).execute(remaining);
+          } else {
+            id(fan_relay).turn_off();
+            ESP_LOGI("fan", "Run-on elapsed - fan OFF");
+          }
+
+  - id: fan_min_wait
+    mode: restart
+    parameters:
+      remaining_ms: uint32_t
+    then:
+      - delay: !lambda "return remaining_ms;"
+      - switch.turn_off: fan_relay
+      - logger.log: "Min runtime reached - fan OFF"
+
+  # Shared manual-toggle action for both physical buttons
+  - id: manual_fan_toggle
+    then:
+      - switch.turn_off: auto_mode
+      - switch.toggle: fan_relay
+      - logger.log: "Manual fan toggle - automation suspended"
+
+switch:
+  # Automation on/off - suspend for maintenance without unplugging
+  - platform: template
+    name: Automatic Mode
+    id: auto_mode
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    icon: mdi:refresh-auto
+    turn_off_action:
+      - script.stop: fan_off_delay
+      - script.stop: fan_min_wait
+      - lambda: id(manual_resume_armed) = false;
+      - logger.log: "Automatic mode OFF - fan under manual control (resumes on next print)"
+    turn_on_action:
+      - logger.log: "Automatic mode ON"
+
+  # Channel 1: printer line - web UI control only, remembers state
+  - platform: gpio
+    name: Printer Line
+    pin: GPIO27
+    id: relay_main
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # Channel 2: fan
+  - platform: gpio
+    name: Fan
+    pin: GPIO14
+    id: fan_relay
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - lambda: |-
+          // Track start time for any ON, including manual, so the fault
+          // check's spin-up guard and min-runtime maths have a valid anchor.
+          id(fan_started_ms) = millis();
+
+  - platform: restart
+    name: Restart
+
+binary_sensor:
+  # On-board button: short press = manual fan toggle, long press = auto mode ON
+  - platform: gpio
+    pin:
+      number: GPIO0
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: Button
+    internal: true
+    on_click:
+      - max_length: 350ms
+        then:
+          - script.execute: manual_fan_toggle
+      - min_length: 360ms
+        max_length: 3s
+        then:
+          - switch.turn_on: auto_mode
+
+  # S2 terminal: external pushbutton -> manual fan toggle
+  - platform: gpio
+    pin:
+      number: GPIO33
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: S2 Input
+    internal: true
+    filters:
+      - delayed_on_off: 50ms
+    on_press:
+      - script.execute: manual_fan_toggle
+
+  # S1 terminal: spare input, exposed but unused
+  - platform: gpio
+    pin:
+      number: GPIO32
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: S1 Input
+
+  # Fan fault: relay ON but fan draws no power = dead/unplugged fan
+  - platform: template
+    name: Fan Fault
+    id: fan_fault
+    device_class: problem
+
+text_sensor:
+  - platform: template
+    name: Status
+    icon: mdi:printer-3d
+    update_interval: 10s
+    lambda: |-
+      if (!id(auto_mode).state) return {"Manual mode"};
+      if (!id(fan_relay).state) return {"Idle"};
+      if (id(fan_off_delay).is_running() || id(fan_min_wait).is_running())
+        return {"Purging"};
+      return {"Printing"};
+
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          // Fan health: if the fan relay is on, channel 2 must draw power.
+          // Skip the first 10 s after switch-on so the meter has a fresh
+          // reading and the fan has spun up.
+          // Threshold 1 W suits typical extraction fans - raise/lower to
+          // roughly half your fan's rated wattage if needed.
+          bool on_long_enough = (millis() - id(fan_started_ms)) > 10000;
+          bool fault = id(fan_relay).state && on_long_enough
+                       && !isnan(id(fan_power).state)
+                       && id(fan_power).state < 1.0;
+          id(fan_fault).publish_state(fault);
+          if (fault) {
+            ESP_LOGW("fan", "Fan relay ON but no power draw - check the fan!");
+          }
+
+status_led:
+  pin:
+    number: GPIO13
+    inverted: true
